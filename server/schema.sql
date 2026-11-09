@@ -37,3 +37,7 @@ CREATE TABLE IF NOT EXISTS usage (
   day   TEXT PRIMARY KEY,
   count INTEGER NOT NULL DEFAULT 0
 );
+
+-- Abuse protection (also created automatically by the server on first use).
+CREATE TABLE IF NOT EXISTS ip_usage (ip TEXT NOT NULL, bucket TEXT NOT NULL, count INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (ip, bucket));
+CREATE TABLE IF NOT EXISTS auth_fail (ip TEXT NOT NULL, bucket TEXT NOT NULL, count INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (ip, bucket));
