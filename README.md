@@ -187,7 +187,7 @@ tapping outside it does nothing, so an answer cannot disappear by accident. If a
 the panel says so instead of closing.
 
 **Quiz** builds a classroom quiz of 5 to 50 questions, hardest first: matching questions from the IOE and
-IOM question bank (252 questions, Grade 11 or 12 to match the class), then AI practice questions on the
+IOM question bank (over 650 questions, Grade 11 or 12 to match the class), then AI practice questions on the
 open chapter. About half are logical and critical-thinking questions (assertion and reason, statements,
 predict, cause and effect, graph, compare, spot the error). Every AI-written answer is re-solved
 independently and its arithmetic recomputed before it is shown. Each question shows its source and type.
