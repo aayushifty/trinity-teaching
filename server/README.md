@@ -11,7 +11,7 @@ Any key stays on the server, never on a board or in the public app download.
   comes from the official key when there is one; otherwise it is marked "worked out by AI". If the
   bank does not have enough matching questions, AI practice questions fill the gap and are labelled.
 - Models, both free:
-  1. **Google Gemini** (`GEMINI_MODEL`, default `gemini-3.5-flash`), using the free tier of a Google AI Studio key.
+  1. **Google Gemini** (`gemini-flash-lite-latest`, `gemini-flash-latest`, `gemini-2.5-flash`), using the free tier of a Google AI Studio key.
   2. **Cloudflare Workers AI** (`CF_MODEL`, default Llama 3.3 70B). It is free up to 10,000 "neurons" a day
      (roughly 100–200 answers) and needs no key.
   Gemini answers first. If its free limit is reached for the minute or the day, Workers AI answers instead.
@@ -90,6 +90,20 @@ These are practice questions, not past papers. The app labels them **"Question b
 
 **Chapter matching.** A question is offered only when it belongs to the open chapter: two of its specific words (question plus correct answer) appear in the slides, or one does and its topic is clearly the chapter's. `node scripts/bank-match-test.mjs bank.sql.json` shows the matches for sample chapters.
 
+### Adding more questions (no re-import)
+
+`server/bank/*.jsonl` holds extra IOE and IOM practice questions (one JSON object per line: `exam`,
+`subject`, `grade`, `topic`, `question`, four `options`, `answer`, `explanation`, `difficulty`). They are
+added on top of the existing bank, and running it again skips questions already there:
+
+```bash
+cd server
+node scripts/add-bank.mjs bank/*.jsonl > extra.sql
+npx wrangler d1 execute trinity-ai --remote --file=extra.sql
+```
+
+New questions wait (`verified = 0`) until the background check has re-solved them (15 every 5 minutes).
+
 ## Adding past papers
 
 Scan or download each paper as a PDF (one exam and year per file). With an answer key, pass it too.
@@ -112,6 +126,28 @@ List or remove papers:
 curl -H "Authorization: Bearer %ADMIN_TOKEN%" %AI_SERVER%/admin/papers
 curl -X DELETE -H "Authorization: Bearer %ADMIN_TOKEN%" %AI_SERVER%/admin/papers/12
 ```
+
+## Security
+
+The access code is built into the app so boards need no setup, which means anyone with the app file
+can read it. The server therefore limits what that code can do:
+
+- **Lockout:** 20 wrong access codes or admin tokens from one address lock that address out for 15 minutes.
+- **Per-network cap:** `PER_IP_HOURLY` (default 300) AI requests an hour per address, on top of the college-wide `DAILY_LIMIT`.
+- **Network lock (optional, `wrangler.toml`):** `ALLOWED_COUNTRIES = "NP"` serves Nepal only; `ALLOWED_IPS = "a.b.c.,d.e.f.g"` serves only the college network (exact addresses, or prefixes ending in `.`). `/health` shows the `country` Cloudflare sees for you; check it before setting this.
+- **Rotating the code:** set `ACCESS_CODE` to `new,old`, publish the app update built with the new code, then set it to `new` alone once every board has updated.
+- Requests over 6 MB are refused; secrets are compared as SHA-256 digests in constant time; responses are `no-store` and `nosniff`.
+- `ADMIN_TOKEN` and `GEMINI_API_KEY` exist only on the server, never in the app.
+
+## Which AI model answers
+
+1. Gemini, free tier: `gemini-flash-lite-latest` → `gemini-flash-latest` → `gemini-2.5-flash` for Ask and the answer check;
+   `gemini-flash-latest` first for Quiz. `GEMINI_MODEL` puts one model in front; `GEMINI_MODELS = "a,b,c"` replaces the order.
+2. Cloudflare Workers AI: `CF_MODEL` (Llama 3.3 70B), then `CF_FALLBACK_MODEL` (Llama 3.1 8B, Ask only).
+
+A model that is rate-limited, slow, renamed (404/400) or down is skipped for a while and the next one answers.
+A refused Gemini key skips Gemini and uses Workers AI; if nothing else can answer, the app shows "not set up correctly".
+`npx wrangler tail` shows which model answered (`via`) and why others were skipped.
 
 ## Cost and limits
 

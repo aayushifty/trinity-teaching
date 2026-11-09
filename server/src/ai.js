@@ -7,8 +7,12 @@
 import { syllabusBlock } from './syllabus.js';
 
 export const MODEL = 'gemini (free) + workers-ai fallback';
-const GEMINI_DEFAULT = 'gemini-3.5-flash';
+// "-latest" aliases never 404 when Google renames a release; gemini-2.5-flash is a pinned stable backstop.
+const GEMINI_DEFAULT = 'gemini-flash-latest';
+const GEMINI_STABLE = 'gemini-2.5-flash';
 const CF_DEFAULT = '@cf/meta/llama-3.3-70b-instruct-fp8-fast';
+// Last-resort Cloudflare model: small and fast, so Ask still answers when the 70B model is slow.
+const CF_LAST = '@cf/meta/llama-3.1-8b-instruct-fast';
 
 const RULES_COMMON = `You work inside Trinity Teaching, the classroom app used on interactive boards at Trinity International SS & College, Kathmandu, for +2 Science. A teacher is teaching one chapter, and the students are preparing for the entrance exams after Grade 12: IOE (engineering) and IOM (medical).
 
@@ -112,6 +116,7 @@ function parseJson(text) {
 }
 
 class Busy extends Error {}
+class KeyRejected extends Busy {}
 
 // ---------- speed: time limits and busy-model memory ----------
 // Free models that are overloaded can take minutes just to say "busy". Every attempt gets a
@@ -144,17 +149,24 @@ async function markBusy(env, model, ms = BUSY_FOR_MS) {
 // Ask and the answer check: the fast model first. Quiz: the stronger model first, then the fast one.
 const LITE = 'gemini-flash-lite-latest';
 const ORDER = {
-  ask: [LITE, 'gemini-flash-latest', GEMINI_DEFAULT],
-  check: [LITE, 'gemini-flash-latest', GEMINI_DEFAULT],
-  quiz: [GEMINI_DEFAULT, 'gemini-flash-latest', LITE],
+  ask: [LITE, GEMINI_DEFAULT, GEMINI_STABLE],
+  check: [LITE, GEMINI_DEFAULT, GEMINI_STABLE],
+  quiz: [GEMINI_DEFAULT, LITE, GEMINI_STABLE],
 };
 // One hard deadline per request, whatever happens. Part of it is always kept back so the
 // Cloudflare backup model can still answer if every Gemini model is slow or rate-limited.
-const BUDGET_MS = { ask: 30000, check: 25000, quiz: 60000 };
-const BACKUP_RESERVE_MS = { ask: 12000, check: 10000, quiz: 25000 };
-// The stronger models are often overloaded on the free tier: never wait long for them.
-const ATTEMPT_MS = { ask: 12000, check: 20000, quiz: 40000 };
-const attemptLimit = (model, kind) => (model === LITE ? ATTEMPT_MS[kind] : Math.min(ATTEMPT_MS[kind], 15000));
+// Quiz batches are small (see BATCH in index.js) but still write several thousand tokens of JSON:
+// a 15 s cap made every model time out on 10+ question quizzes, so quiz attempts get 40 s.
+const BUDGET_MS = { ask: 30000, check: 40000, quiz: 95000 };
+const BACKUP_RESERVE_MS = { ask: 12000, check: 0, quiz: 35000 };
+const ATTEMPT_MS = { ask: 12000, check: 25000, quiz: 40000 };
+
+/** GEMINI_MODELS="a,b,c" in wrangler.toml replaces the built-in order (GEMINI_MODEL alone goes first). */
+function geminiNames(env, kind) {
+  const custom = String(env.GEMINI_MODELS || '').split(',').map((s) => s.trim()).filter(Boolean);
+  const preferred = env.GEMINI_MODEL ? [String(env.GEMINI_MODEL).trim()] : [];
+  return [...new Set(custom.length ? custom : [...preferred, ...ORDER[kind]])];
+}
 
 async function withTimeout(promise, ms, onTimeout) {
   let timer;
@@ -167,8 +179,7 @@ async function withTimeout(promise, ms, onTimeout) {
 
 async function gemini(env, req) {
   await loadBusy(env);
-  const preferred = env.GEMINI_MODEL && env.GEMINI_MODEL !== GEMINI_DEFAULT ? [env.GEMINI_MODEL] : [];
-  const names = [...new Set([...preferred, ...ORDER[req.kind]])];
+  const names = geminiNames(env, req.kind);
   // Busy models go last, not away: if every model is marked busy, they are still tried if time allows.
   const ordered = [...names.filter((m) => !isBusy(m)), ...names.filter(isBusy)];
   const reserve = env.AI ? BACKUP_RESERVE_MS[req.kind] : 0;
@@ -177,10 +188,11 @@ async function gemini(env, req) {
     const left = req.deadline - Date.now() - reserve;
     if (left < 3000) { tried.push('gemini: out of time, using the backup model'); break; }
     try {
-      return { model, data: await geminiModel(env, model, req, Math.min(attemptLimit(model, req.kind), left)), tried };
+      return { model, data: await geminiModel(env, model, req, Math.min(ATTEMPT_MS[req.kind], left)), tried };
     } catch (e) {
       if (!(e instanceof Busy)) throw e;
       tried.push(e.message);
+      if (e instanceof KeyRejected) throw e; // no other Gemini model can work with this key
     }
   }
   throw new Busy(tried.join(' | ') || 'no gemini model');
@@ -218,7 +230,13 @@ async function geminiModel(env, model, { system, user, schema, maxTokens, image 
   }
   if (res.status === 404 || res.status >= 500) { await markBusy(env, model); throw new Busy(why); }
   if (!res.ok) {
-    if (res.status === 400 || res.status === 403) throw new AIError(`The AI server is not set up correctly (Gemini: ${message || res.status}).`, 500);
+    // A bad or revoked key affects every Gemini model: skip Gemini and let Workers AI answer.
+    if (res.status === 401 || res.status === 403 || /api key/i.test(message)) {
+      console.error('GEMINI_API_KEY rejected:', message.slice(0, 200));
+      throw new KeyRejected(why);
+    }
+    // Other 400s are model-specific (renamed model, unsupported option): try the next model.
+    await markBusy(env, model);
     throw new Busy(why);
   }
   const cand = data.candidates?.[0];
@@ -228,17 +246,32 @@ async function geminiModel(env, model, { system, user, schema, maxTokens, image 
   return parseJson((cand.content?.parts || []).map((p) => p.text || '').join(''));
 }
 
-async function workersAi(env, { backupSystem, user, schema, maxTokens, deadline }) {
+/** Cloudflare Workers AI: CF_MODEL, then the small fast model for Ask if time is left. */
+async function workersAi(env, { kind, backupSystem, user, schema, maxTokens, deadline }) {
   if (!env.AI) throw new Busy('workers-ai not bound');
-  const model = env.CF_MODEL || CF_DEFAULT;
-  const limit = Math.max(deadline - Date.now(), 8000);
-  const out = await withTimeout(env.AI.run(model, {
-    messages: [{ role: 'system', content: backupSystem }, { role: 'user', content: user }],
-    response_format: { type: 'json_schema', json_schema: schema },
-    max_tokens: Math.min(maxTokens, 8000),
-    temperature: 0.2,
-  }), limit, () => new Busy(`workers-ai: no answer in ${Math.round(limit / 1000)}s`));
-  return { model, data: parseJson(out?.response ?? out) };
+  const first = env.CF_MODEL || CF_DEFAULT;
+  // The 8B model is too weak to write quiz questions safely; it only backs up Ask.
+  const models = [...new Set([first, ...(kind === 'ask' ? [env.CF_FALLBACK_MODEL || CF_LAST] : [])])];
+  const tried = [];
+  for (let i = 0; i < models.length; i++) {
+    const model = models[i];
+    const left = deadline - Date.now();
+    // Keep ~8 s for the last model when there is one after this.
+    const limit = Math.max(i < models.length - 1 ? left - 8000 : left, 8000);
+    try {
+      const out = await withTimeout(env.AI.run(model, {
+        messages: [{ role: 'system', content: backupSystem }, { role: 'user', content: user }],
+        response_format: { type: 'json_schema', json_schema: schema },
+        max_tokens: Math.min(maxTokens, 8000),
+        temperature: 0.2,
+      }), limit, () => new Busy(`workers-ai ${model}: no answer in ${Math.round(limit / 1000)}s`));
+      return { model, data: parseJson(out?.response ?? out), tried };
+    } catch (e) {
+      if (e instanceof AIError && i === models.length - 1) throw e;
+      tried.push(String(e?.message || e).slice(0, 160));
+    }
+  }
+  throw new Busy(tried.join(' | '));
 }
 
 /** Long chapters, shortened evenly so every slide keeps its opening (title and key lines). */
@@ -251,11 +284,11 @@ function shorten(context, maxChars) {
 }
 
 /** Gemini first; on rate limits, slowness or outages fall back to Workers AI — all within one deadline. */
-async function callModel(env, { kind, rules, context, exams, userText, schema, maxTokens, geminiOnly = false, image = null }) {
+async function callModel(env, { kind, rules, context, exams, userText, schema, maxTokens, geminiOnly = false, image = null, until = Infinity }) {
   const syl = syllabusBlock(context.subject, exams);
   const req = {
     kind,
-    deadline: Date.now() + BUDGET_MS[kind],
+    deadline: Math.min(Date.now() + BUDGET_MS[kind], until),
     system: `${rules}\n\n${slidesBlock(context)}${syl ? `\n\n${syl}` : ''}`,
     // The backup model is slow on long input: it gets each slide's opening lines only.
     backupSystem: `${rules}\n\n${slidesBlock(shorten(context, 12000))}${syl ? `\n\n${syl}` : ''}`,
@@ -268,6 +301,7 @@ async function callModel(env, { kind, rules, context, exams, userText, schema, m
   const order = [env.GEMINI_API_KEY && gemini, !geminiOnly && !image && env.AI && workersAi].filter(Boolean);
   if (!order.length) throw new AIError('The AI server has no AI model set up.', 500);
   const skipped = [];
+  let keyError = null;
   for (const fn of order) {
     try {
       const { model, data, tried = [] } = await fn(env, req);
@@ -277,9 +311,13 @@ async function callModel(env, { kind, rules, context, exams, userText, schema, m
       return data;
     } catch (e) {
       if (e instanceof AIError) throw e;
-      skipped.push(String(e.message || e).slice(0, 200)); // busy, slow or unreachable: try the next free model
+      if (e instanceof KeyRejected) keyError = e;
+      skipped.push(String(e.message || e).slice(0, 200)); // busy, slow, unreachable or bad key: try the next free model
     }
   }
+  console.warn('all models failed', kind, JSON.stringify(skipped)); // visible in `wrangler tail`
+  // Nothing answered and the key was refused: say so, so the admin fixes the key.
+  if (keyError) throw new AIError(`The AI server is not set up correctly (${keyError.message}).`, 500);
   throw new AIError('The free AI models are busy right now. Try again in a minute.', 429);
 }
 
@@ -303,7 +341,7 @@ export function ask(env, { context, query, pastList, exams, image = null }) {
   });
 }
 
-export function quiz(env, { context, count, pastList, exams, avoid = '', focus = '' }) {
+export function quiz(env, { context, count, pastList, exams, avoid = '', focus = '', until }) {
   return callModel(env, {
     kind: 'quiz',
     rules: QUIZ_RULES,
@@ -315,6 +353,7 @@ export function quiz(env, { context, count, pastList, exams, avoid = '', focus =
       + `Build a quiz of ${count} questions for this chapter for these exams: ${(exams || []).join(', ')}.`,
     schema: QUIZ_SCHEMA,
     maxTokens: Math.min(16000, 1500 + count * 900),
+    until,
   });
 }
 
@@ -349,7 +388,7 @@ const CHECK_SCHEMA = {
 };
 
 /** Re-solves practice questions independently: returns { checks: [{ index, answer|null, explanation }] }. */
-export function check(env, { context, items }) {
+export function check(env, { context, items, until }) {
   const list = items.map((q, i) => `Q${i}. ${q.question}\nA) ${q.options[0]}\nB) ${q.options[1]}\nC) ${q.options[2]}\nD) ${q.options[3]}`).join('\n\n');
   return callModel(env, {
     kind: 'check',
@@ -361,5 +400,6 @@ export function check(env, { context, items }) {
     userText: `QUESTIONS (index = the number after Q)\n\n${list}`,
     schema: CHECK_SCHEMA,
     maxTokens: 8000,
+    until,
   });
 }

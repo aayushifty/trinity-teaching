@@ -3,6 +3,13 @@
 Trinity Teaching: chapter presentations for every classroom board, with AI study support.
 Android and Windows apps update themselves through **Check for updates**; an APK is only reinstalled when noted.
 
+## 1.8.0 (9 November 2026)
+No reinstall: arrives through **Check for updates**. The AI server fixes apply to every board straight away.
+- **AI Quiz loads reliably.** Quizzes of 10 or more questions always failed with "The free AI models are busy": each AI call was asked for up to 15 questions at once, longer than any free model could write within its time limit. Questions are now written in smaller sets, three at a time, and every call stays inside the time the app waits.
+- **Backup AI models set up properly.** Gemini now uses names that keep working when Google renames a release (`gemini-flash-lite-latest`, `gemini-flash-latest`, then the stable `gemini-2.5-flash`); the old default `gemini-3.5-flash` no longer existed. If Gemini is busy, renamed or its key is refused, Cloudflare Workers AI answers (Llama 3.3 70B, then Llama 3.1 8B for Ask).
+- **Security:** wrong access codes or admin tokens from one address are locked out for 15 minutes after 20 tries; each network is capped at 300 AI requests an hour; oversized requests are refused; secret checks no longer reveal their length; the access code can be rotated without breaking boards; optional lock to Nepal or to the college network (`ALLOWED_COUNTRIES`, `ALLOWED_IPS`).
+- **410 more IOE and IOM questions** in the question bank (physics, chemistry, mathematics, biology, English; Grade 11 and 12). Each is re-solved by the AI check before any class sees it.
+
 ## 1.7.0 (15 October 2026)
 **The app itself updates in one click from now on.** Older apps receive 1.7.0 through Check for updates and then show **Update app to 1.7.0**: on Android it opens the download (tap Install once); on Windows it shows the download page for a one-time install. From 1.7.0, Update app installs new versions by itself.
 - **Update app:** the installed app downloads its own new version, checks it and installs it (Windows: silently, then reopens; Android: Android's Update confirmation). Needed for presenting PowerPoint files.

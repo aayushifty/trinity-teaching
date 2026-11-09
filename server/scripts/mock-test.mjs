@@ -35,6 +35,28 @@ globalThis.fetch = async () => new Response(JSON.stringify({ error: { message: '
 await assert.rejects(ask({ GEMINI_API_KEY: 'bad' }), (e) => e.status === 500 && /API key not valid/.test(e.message));
 console.log('4 bad key reported: ok');
 
+// 4b. Wrong Gemini key but Workers AI bound -> the backup still answers
+assert.match((await ask({ GEMINI_API_KEY: 'bad', AI: { run: async (m) => ({ response: { ...reply, answer: `from ${m}` } }) } })).answer, /^from @cf\//);
+console.log('4b bad key falls back to Workers AI: ok');
+
+// 4c. Renamed Gemini model (400 without a key error) -> next Gemini model answers
+{
+  let calls = 0;
+  globalThis.fetch = async () => (++calls === 1
+    ? new Response(JSON.stringify({ error: { message: 'model does not support responseJsonSchema' } }), { status: 400 })
+    : new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: JSON.stringify(reply) }] } }] }), { status: 200 }));
+  assert.equal((await ask({ GEMINI_API_KEY: 'k', GEMINI_MODEL: 'renamed-model-4c' })).answer, 'ok');
+  console.log('4c model-specific 400 tries the next model: ok');
+}
+
+// 4d. Workers AI main model times out -> small fast model answers Ask
+{
+  globalThis.fetch = async () => new Response('{}', { status: 429 });
+  const run = async (m) => (m.includes('70b') ? new Promise(() => {}) : { response: { ...reply, answer: `from ${m}` } });
+  assert.match((await ask({ GEMINI_API_KEY: 'k', AI: { run } })).answer, /8b/);
+  console.log('4d second Workers AI model answers: ok');
+}
+
 // 5. No Gemini key -> Workers AI only (string reply)
 assert.equal((await ask({ AI: { run: async () => ({ response: JSON.stringify(reply) }) } })).answer, 'ok');
 console.log('5 Workers AI only: ok');
