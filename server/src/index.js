@@ -447,14 +447,29 @@ async function checkAnswers(env, context, items, until) {
   const drop = new Set();
   todo.forEach(({ q, i }, k) => {
     const c = verdict.get(k);
-    if (!c) return;
-    if (!c.answer) { drop.add(i); return; }
-    if (c.answer !== q.answer) {
-      q.answer = c.answer;
+    const letter = verdictFor(c, q.options);
+    if (letter === undefined) return;
+    if (!letter) { drop.add(i); return; }
+    if (letter !== q.answer) {
+      q.answer = letter;
       if (c.explanation) q.explanation = steps(c.explanation);
     }
   });
   return items.filter((_, i) => !drop.has(i));
+}
+
+const sameText = (a, b) => String(a ?? '').toLowerCase().replace(/\s+/g, ' ').trim() === String(b ?? '').toLowerCase().replace(/\s+/g, ' ').trim();
+
+/**
+ * The check's verdict as a letter, decided by the option TEXT it copied (models slip on letters):
+ *   'A'–'D' = this option is right, null = no option is clearly right, undefined = no usable verdict.
+ */
+export function verdictFor(c, options) {
+  if (!c) return undefined;
+  if (!c.answer) return null;
+  const k = (options || []).findIndex((o) => sameText(o, c.answer_text));
+  if (k < 0) return undefined; // text missing or matches no option: check again later
+  return 'ABCD'[k];
 }
 
 /** Four distinct, real options (not just "A", "B" …). */
@@ -528,15 +543,16 @@ async function verifyBatch(env) {
   const updates = [];
   results.forEach((q, k) => {
     const c = verdict.get(k);
-    if (!c) return; // not answered this time: try again next run
-    if (!c.answer) {
+    const letter = verdictFor(c, items[k].options);
+    if (letter === undefined) return; // no usable answer this time: try again next run
+    if (!letter) {
       updates.push(env.DB.prepare('UPDATE questions SET verified = -1 WHERE id = ?').bind(q.id));
     } else if (!q.answer) {
-      updates.push(env.DB.prepare("UPDATE questions SET answer = ?, answer_source = 'ai', explanation = COALESCE(NULLIF(explanation, ''), ?), verified = 1 WHERE id = ?").bind(c.answer, steps(c.explanation), q.id));
-    } else if (c.answer === q.answer) {
+      updates.push(env.DB.prepare("UPDATE questions SET answer = ?, answer_source = 'ai', explanation = COALESCE(NULLIF(explanation, ''), ?), verified = 1 WHERE id = ?").bind(letter, steps(c.explanation), q.id));
+    } else if (letter === q.answer) {
       updates.push(env.DB.prepare('UPDATE questions SET verified = 1 WHERE id = ?').bind(q.id));
     } else {
-      updates.push(env.DB.prepare('UPDATE questions SET verified = -2, check_answer = ? WHERE id = ?').bind(c.answer, q.id));
+      updates.push(env.DB.prepare('UPDATE questions SET verified = -2, check_answer = ? WHERE id = ?').bind(letter, q.id));
     }
   });
   if (updates.length) await env.DB.batch(updates);
