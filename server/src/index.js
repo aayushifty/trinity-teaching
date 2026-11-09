@@ -17,18 +17,107 @@ const CORS = {
   'access-control-allow-headers': 'content-type, x-access-code, authorization',
   'access-control-max-age': '86400',
 };
-const json = (body, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json; charset=utf-8', ...CORS } });
+const SECURITY_HEADERS = {
+  'x-content-type-options': 'nosniff',
+  'cache-control': 'no-store',
+  'referrer-policy': 'no-referrer',
+  'strict-transport-security': 'max-age=31536000',
+};
+const json = (body, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json; charset=utf-8', ...CORS, ...SECURITY_HEADERS } });
 const fail = (message, status) => json({ error: message }, status);
 
 const EXAMS = ['IOE', 'IOM'];
 const SUBJECTS = ['physics', 'chemistry', 'mathematics', 'biology', 'english'];
 const MAX_SLIDE_CHARS = 120000;
+const MAX_BODY_BYTES = 6_000_000; // a 3 MB picture as base64 plus the slides
 
-function sameSecret(a = '', b = '') {
-  if (!a || !b || a.length !== b.length) return false;
+const sha256 = async (s) => new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s)));
+
+/** Constant-time comparison of fixed-length digests: leaks neither content nor length. */
+async function sameSecret(a = '', b = '') {
+  if (!a || !b) return false;
+  const [x, y] = await Promise.all([sha256(a), sha256(b)]);
   let d = 0;
-  for (let i = 0; i < a.length; i++) d |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  for (let i = 0; i < x.length; i++) d |= x[i] ^ y[i];
   return d === 0;
+}
+
+/** ACCESS_CODE may list several codes ("new,old") so the code can be rotated without breaking boards mid-update. */
+async function codeAccepted(given, env) {
+  const codes = String(env.ACCESS_CODE || '').split(',').map((s) => s.trim()).filter(Boolean);
+  const hits = await Promise.all(codes.map((c) => sameSecret(given, c)));
+  return hits.some(Boolean);
+}
+
+// ---------- abuse protection ----------
+// The access code ships inside the app, so it is not a strong secret on its own. These limits stop
+// anyone who extracts it from draining the college's free AI allowance or guessing the admin token.
+
+const clientIp = (req) => req.headers.get('cf-connecting-ip') || 'unknown';
+const csv = (v) => String(v || '').split(',').map((s) => s.trim()).filter(Boolean);
+
+/**
+ * Optional network lock (wrangler.toml):
+ *   ALLOWED_COUNTRIES = "NP"                 only requests from these countries
+ *   ALLOWED_IPS       = "202.51.,103.10.1.5" only these addresses, or prefixes ending in "." or ":"
+ */
+function networkAllowed(req, env) {
+  const countries = csv(env.ALLOWED_COUNTRIES).map((c) => c.toUpperCase());
+  if (countries.length && !countries.includes(String(req.cf?.country || '').toUpperCase())) return false;
+  const ips = csv(env.ALLOWED_IPS);
+  const ip = clientIp(req);
+  if (ips.length && !ips.some((p) => ip === p || ((p.endsWith('.') || p.endsWith(':')) && ip.startsWith(p)))) return false;
+  return true;
+}
+
+let guardReady = false;
+async function guardTables(db) {
+  if (guardReady) return;
+  await db.batch([
+    db.prepare('CREATE TABLE IF NOT EXISTS ip_usage (ip TEXT NOT NULL, bucket TEXT NOT NULL, count INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (ip, bucket))'),
+    db.prepare('CREATE TABLE IF NOT EXISTS auth_fail (ip TEXT NOT NULL, bucket TEXT NOT NULL, count INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (ip, bucket))'),
+  ]);
+  guardReady = true;
+}
+
+const bucket = (minutes) => String(Math.floor(Date.now() / (minutes * 60000)));
+const FAIL_WINDOW_MIN = 15;
+const MAX_FAILS = 20;
+
+async function bump(env, table, ip, b) {
+  const row = await env.DB.prepare(
+    `INSERT INTO ${table} (ip, bucket, count) VALUES (?, ?, 1) ON CONFLICT(ip, bucket) DO UPDATE SET count = count + 1 RETURNING count`,
+  ).bind(ip, b).first();
+  return row?.count || 1;
+}
+
+/** True when this address has failed authentication too often in the current 15-minute window. */
+async function lockedOut(env, ip) {
+  try {
+    await guardTables(env.DB);
+    const row = await env.DB.prepare('SELECT count FROM auth_fail WHERE ip = ? AND bucket = ?').bind(ip, bucket(FAIL_WINDOW_MIN)).first();
+    return (row?.count || 0) >= MAX_FAILS;
+  } catch { return false; } // the guard never blocks the school if the database hiccups
+}
+
+async function noteFailure(env, ip) {
+  try { await guardTables(env.DB); await bump(env, 'auth_fail', ip, bucket(FAIL_WINDOW_MIN)); } catch { /* ignore */ }
+}
+
+/** Per-address hourly cap (PER_IP_HOURLY, default 300: a whole school network shares one address). */
+async function ipWithinLimit(env, ip) {
+  try {
+    await guardTables(env.DB);
+    return (await bump(env, 'ip_usage', ip, bucket(60))) <= Number(env.PER_IP_HOURLY || 300);
+  } catch { return true; }
+}
+
+async function pruneGuards(env) {
+  await guardTables(env.DB);
+  await env.DB.batch([
+    env.DB.prepare('DELETE FROM ip_usage WHERE CAST(bucket AS INTEGER) < ?').bind(Number(bucket(60)) - 48),
+    env.DB.prepare('DELETE FROM auth_fail WHERE CAST(bucket AS INTEGER) < ?').bind(Number(bucket(FAIL_WINDOW_MIN)) - 8),
+  ]);
 }
 
 /** Counts one AI request against today's college-wide limit. */
@@ -167,8 +256,10 @@ async function handleQuiz(req, env) {
 }
 
 export const MAX_QUIZ = 50;
-const BATCH = 15;     // practice questions per AI call (fewer calls stay under free-tier rate limits)
-const PARALLEL = 2;   // AI calls at the same time (more trips the free-tier rate limit)
+// Practice questions per AI call. 15 made each reply ~13k tokens, longer than any free model
+// answers inside its time limit, so every 10+ question quiz failed. 6 replies in ~10–25 s.
+const BATCH = 6;
+const PARALLEL = 3;   // AI calls at the same time (more trips the free-tier rate limit)
 
 /**
  * A quiz of `count` questions, toughest first:
@@ -265,7 +356,8 @@ function arithmeticOk(q) {
   return r.ok;
 }
 
-const PRACTICE_DEADLINE_MS = 150000;
+// The app waits 240 s for a quiz; finish well inside that.
+const PRACTICE_DEADLINE_MS = 200000;
 
 /**
  * Practice questions for the part of the quiz the bank cannot fill. Batches of up to 10 cover
@@ -283,6 +375,7 @@ async function practiceQuestions(env, { context, exams, need, avoid }) {
     const parts = slideParts(context.slides, Math.ceil(short / BATCH));
     const avoidText = [...avoid, ...items].map((q) => `- ${q.question}`).join('\n');
     const tasks = parts.map((slides, i) => async () => {
+      if (Date.now() > deadline - 35000) return { items: [], meta: null }; // too late to start another batch
       const n = Math.ceil(short / parts.length);
       const ctx = compact({ ...context, slides }, 30000);
       const where = parts.length > 1
@@ -298,7 +391,7 @@ async function practiceQuestions(env, { context, exams, need, avoid }) {
           ? 'In this set write mostly tough multi-step numericals on this chapter, plus a few prediction or comparison questions.'
           : 'Make about half of the questions logical and critical-thinking ones (assertion and reason, statements, predict, cause and effect, graph, compare, error spotting) and half tough numericals.';
       const focus = [where, mix].filter(Boolean).join(' ');
-      const r = await ai.quiz(env, { context: ctx, count: n + 3, exams, pastList: '', avoid: avoidText, focus });
+      const r = await ai.quiz(env, { context: ctx, count: n + 2, exams, pastList: '', avoid: avoidText, focus, until: deadline - 20000 });
       const fresh = list(r.items)
         .filter((it) => it && typeof it === 'object' && it.question_id == null && it.question && goodOptions(it.options) && /^[ABCD]$/.test(it.answer))
         // Right grade only: a Class 12 chapter gets Grade 12 questions, a Class 11 chapter Grade 11.
@@ -310,7 +403,7 @@ async function practiceQuestions(env, { context, exams, need, avoid }) {
         }));
       // Accuracy first: every AI-written answer is re-solved, then every calculation in its
       // worked solution is recomputed exactly, before it reaches the board.
-      const checked = await checkAnswers(env, ctx, fresh);
+      const checked = await checkAnswers(env, ctx, fresh, deadline);
       return { items: checked.filter(arithmeticOk), meta: r.meta };
     });
     const t0 = Date.now();
@@ -335,12 +428,12 @@ async function practiceQuestions(env, { context, exams, need, avoid }) {
  * official key) is solved again independently. A different answer replaces the AI's; a question
  * the check finds wrong or ambiguous is dropped. Official-key answers are never touched.
  */
-async function checkAnswers(env, context, items) {
+async function checkAnswers(env, context, items, until) {
   const todo = items.map((q, i) => ({ q, i })).filter(({ q }) => q.answerSource === 'practice' || q.answerSource === 'ai');
   if (!todo.length) return items;
   let result;
   try {
-    result = await ai.check(env, { context, items: todo.map(({ q }) => q) });
+    result = await ai.check(env, { context, items: todo.map(({ q }) => q), until });
   } catch {
     return items; // the check is a bonus; if it is unavailable, keep the quiz
   }
@@ -447,6 +540,7 @@ async function verifyBatch(env) {
 export default {
   async scheduled(event, env, ctx) {
     ctx.waitUntil(verifyBatch(env).then((r) => console.log('bank check', JSON.stringify(r))).catch((e) => console.error('bank check failed', e?.message || e)));
+    ctx.waitUntil(pruneGuards(env).catch(() => {}));
   },
 
   async fetch(req, env) {
@@ -455,18 +549,24 @@ export default {
     try {
       if (url.pathname === '/health') {
         const row = await env.DB.prepare('SELECT COUNT(*) AS n, SUM(verified = 1) AS ready, SUM(verified = 0) AS waiting FROM questions').first().catch(() => ({ n: 0 }));
-        return json({ ok: true, model: ai.MODEL, demo: env.DEMO_MODE === '1', pastQuestions: row?.ready ?? 0, bank: { total: row?.n ?? 0, ready: row?.ready ?? 0, waitingForCheck: row?.waiting ?? 0 } });
+        // `country` is the caller's own country as Cloudflare sees it: helps set ALLOWED_COUNTRIES.
+        return json({ ok: true, model: ai.MODEL, demo: env.DEMO_MODE === '1', pastQuestions: row?.ready ?? 0, bank: { total: row?.n ?? 0, ready: row?.ready ?? 0, waitingForCheck: row?.waiting ?? 0 }, country: req.cf?.country || null });
       }
+      if (!networkAllowed(req, env)) return fail('AI is only available on the college network.', 403);
+      if (Number(req.headers.get('content-length') || 0) > MAX_BODY_BYTES) return fail('That request is too large. Try a smaller photo.', 413);
+      const ip = clientIp(req);
+      if (await lockedOut(env, ip)) return fail('Too many wrong codes. Try again in 15 minutes.', 429);
       if (url.pathname.startsWith('/admin/')) {
         const token = (req.headers.get('authorization') || '').replace(/^Bearer\s+/i, '');
-        if (!sameSecret(token, env.ADMIN_TOKEN)) return fail('Not authorised.', 401);
+        if (!(await sameSecret(token, env.ADMIN_TOKEN))) { await noteFailure(env, ip); return fail('Not authorised.', 401); }
         if (url.pathname === '/admin/papers' && req.method === 'POST') return await addPaper(req, env);
         if (url.pathname === '/admin/papers' && req.method === 'GET') return await listPapers(env);
         const m = url.pathname.match(/^\/admin\/papers\/(\d+)$/);
         if (m && req.method === 'DELETE') return await deletePaper(env, Number(m[1]));
         return fail('Not found.', 404);
       }
-      if (!sameSecret(req.headers.get('x-access-code') || '', env.ACCESS_CODE)) return fail('Wrong school access code.', 401);
+      if (!(await codeAccepted(req.headers.get('x-access-code') || '', env))) { await noteFailure(env, ip); return fail('Wrong school access code.', 401); }
+      if (!(await ipWithinLimit(env, ip))) return fail('Too many AI requests from this network this hour. Try again later.', 429);
       if (url.pathname === '/ask' && req.method === 'POST') return await handleAsk(req, env);
       if (url.pathname === '/quiz' && req.method === 'POST') return await handleQuiz(req, env);
       return fail('Not found.', 404);
