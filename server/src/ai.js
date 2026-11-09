@@ -43,7 +43,7 @@ const QUIZ_RULES = `${RULES_COMMON}
 Build a classroom quiz of the requested length for this chapter.
 - Choose from QUESTION BANK only questions that test what this chapter's SLIDES teach. Never use a question about a topic this chapter does not cover.
 - Match the class in the CHAPTER line. For a Class 12 chapter, every question must test Grade 12 content of this chapter (the Grade 12 syllabus): never Grade 11 topics, even ones related to the chapter. For a Class 11 chapter, test Grade 11 content only.
-- Mix question types, all on this chapter only: about half numericals, and the rest logical and critical-thinking questions such as assertion and reason, "which of these statements are correct", predict what happens if a quantity changes, cause and effect, interpreting a graph or table described in words, limiting or special cases, spotting the error in a claim, and comparing two situations. Each must need reasoning with this chapter's ideas, not recall of a single fact, and be rated 4 or 5. Assertion and reason items use the standard four options (both true and the reason explains the assertion; both true but the reason does not explain it; assertion true, reason false; assertion false, reason true). Statement items list two to four numbered statements and ask which are correct. In assertion and reason and statement items, every statement must be clearly true or clearly false by a standard textbook law of this chapter (check each against its governing equation, e.g. L di/dt equals the voltage across the inductor); never use borderline or partly true statements, and only say a reason "explains" an assertion when it is the direct textbook cause. Set qtype for every item. For subjects without numericals (for example Biology or English), make them all reasoning-based.
+- Mix question types as the set instructions below say (if they say nothing: about half numericals), all on this chapter only, and the rest logical and critical-thinking questions such as assertion and reason, "which of these statements are correct", predict what happens if a quantity changes, cause and effect, interpreting a graph or table described in words, limiting or special cases, spotting the error in a claim, and comparing two situations. Each must need reasoning with this chapter's ideas, not recall of a single fact, and be rated 4 or 5. Assertion and reason items use the standard four options (both true and the reason explains the assertion; both true but the reason does not explain it; assertion true, reason false; assertion false, reason true). Statement items list two to four numbered statements and ask which are correct. In assertion and reason and statement items, every statement must be clearly true or clearly false by a standard textbook law of this chapter (check each against its governing equation, e.g. L di/dt equals the voltage across the inductor); never use borderline or partly true statements, and only say a reason "explains" an assertion when it is the direct textbook cause. Set qtype for every item. For subjects without numericals (for example Biology or English), make them all reasoning-based.
 - Prefer the toughest ones: multi-step numericals, conceptual traps, questions that combine ideas. Order the quiz hardest first.
 - Rate every item's difficulty honestly from 1 (direct recall) to 5 (the hardest items in a real IOE or IOM paper). Write practice questions at difficulty 4 or 5: two or more steps, a combination of ideas, a common misconception as a distractor, or a numerical with a twist. Avoid single-fact recall unless the slides offer nothing harder.
 - Never include two questions that test the same fact or are rewordings of each other; each question must test something different.
@@ -341,7 +341,21 @@ export function ask(env, { context, query, pastList, exams, image = null }) {
   });
 }
 
-export function quiz(env, { context, count, pastList, exams, avoid = '', focus = '', until }) {
+/** The quiz schema narrowed to the exams asked for and, when given, their official syllabus units. */
+function quizSchema(exams, units) {
+  const props = QUIZ_SCHEMA.properties.items.items.properties;
+  const item = {
+    ...QUIZ_SCHEMA.properties.items.items,
+    properties: {
+      ...props,
+      style: { type: 'string', enum: exams, description: 'The entrance exam this question is written for.' },
+      ...(units?.length ? { unit: { type: 'string', enum: units, description: 'The official syllabus unit this question tests.' } } : {}),
+    },
+  };
+  return { ...QUIZ_SCHEMA, properties: { items: { ...QUIZ_SCHEMA.properties.items, items: item } } };
+}
+
+export function quiz(env, { context, count, pastList, exams, avoid = '', focus = '', until, units = [] }) {
   return callModel(env, {
     kind: 'quiz',
     rules: QUIZ_RULES,
@@ -350,8 +364,9 @@ export function quiz(env, { context, count, pastList, exams, avoid = '', focus =
     userText: `QUESTION BANK\n${pastList || '(none available for this chapter yet)'}\n\n`
       + (avoid ? `ALREADY IN THE QUIZ (do not repeat or reword these)\n${avoid}\n\n` : '')
       + (focus ? `${focus}\n\n` : '')
-      + `Build a quiz of ${count} questions for this chapter for these exams: ${(exams || []).join(', ')}.`,
-    schema: QUIZ_SCHEMA,
+      + `Build a quiz of ${count} questions for this chapter for these exams: ${(exams || []).join(', ')}.`
+      + (units.length ? ` Every question must test one of these official ${exams.join('/')} syllabus units, named exactly: ${units.join('; ')}.` : ''),
+    schema: exams?.length ? quizSchema(exams, units) : QUIZ_SCHEMA,
     maxTokens: Math.min(16000, 1500 + count * 900),
     until,
   });
