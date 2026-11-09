@@ -103,6 +103,15 @@ npx wrangler d1 execute trinity-ai --remote --file=extra.sql
 ```
 
 New questions wait (`verified = 0`) until the background check has re-solved them (15 every 5 minutes).
+The check returns the text of the option it chose, and the server goes by that text, so a slipped letter can never approve or reject a question.
+
+To check that quizzes stay on the entrance exams, run the live test (it uses about 12 quizzes of the daily limit):
+
+```bash
+AI_SERVER=https://… AI_ACCESS_CODE=… node scripts/exam-focus-test.mjs
+```
+
+It runs a quiz for every subject, +2 group and grade and fails if any question is for an exam the class does not sit, is off its official syllabus unit, is the wrong grade, or if a Biology-group quiz misses IOM or IOE.
 
 ## Adding past papers
 

@@ -150,7 +150,7 @@ async function markBusy(env, model, ms = BUSY_FOR_MS) {
 const LITE = 'gemini-flash-lite-latest';
 const ORDER = {
   ask: [LITE, GEMINI_DEFAULT, GEMINI_STABLE],
-  check: [LITE, GEMINI_DEFAULT, GEMINI_STABLE],
+  check: [GEMINI_DEFAULT, LITE, GEMINI_STABLE], // accuracy matters more than speed here
   quiz: [GEMINI_DEFAULT, LITE, GEMINI_STABLE],
 };
 // One hard deadline per request, whatever happens. Part of it is always kept back so the
@@ -225,7 +225,7 @@ async function geminiModel(env, model, { system, user, schema, maxTokens, image 
   const why = `gemini ${model}: ${res.status} ${message.slice(0, 120)}`;
   if (res.status === 429) {
     // Free-tier quota: per minute (skip briefly) or per day (skip for hours).
-    await markBusy(env, model, /per ?day|PerDay|daily/i.test(message) ? 3 * 60 * 60 * 1000 : 65 * 1000);
+    await markBusy(env, model, /per ?day|PerDay|daily/i.test(JSON.stringify(data.error || {})) ? 3 * 60 * 60 * 1000 : 65 * 1000);
     throw new Busy(why);
   }
   if (res.status === 404 || res.status >= 500) { await markBusy(env, model); throw new Busy(why); }
@@ -376,7 +376,7 @@ export function quiz(env, { context, count, pastList, exams, avoid = '', focus =
 
 const CHECK_RULES = `You are checking multiple-choice questions written for +2 Science students preparing for the IOE and IOM entrance exams, before they are shown in class.
 For each question, ignore the proposed answer and solve the question yourself, carefully and step by step, checking every calculation.
-- If exactly one option is clearly correct, return its letter and a short worked solution of 2 to 4 lines separated by line breaks (formula, substitution, result), in Unicode notation such as ½MR², μ₀, θ, ×, 10⁻³. Work the arithmetic out digit by digit; the last line states the final value, which must equal the option you return. Never refer to options by letter in the solution.
+- If exactly one option is clearly correct, return its letter, its full text exactly as written in answer_text, and a short worked solution of 2 to 4 lines separated by line breaks (formula, substitution, result), in Unicode notation such as ½MR², μ₀, θ, ×, 10⁻³. Work the arithmetic out digit by digit; the last line states the final value, which must equal the option you return. Never refer to options by letter in the solution.
 - If your computed value is not among the options, return answer null.
 - For assertion and reason or numbered-statement items, judge each statement on its own against the governing law or equation of the chapter before choosing; a statement that restates a correct law is true. If any statement is borderline or the "explains" link is debatable, return answer null.
 - Check the result makes physical sense before accepting it (for example a step-down transformer has more primary turns than secondary turns, so its primary current is smaller than its secondary current; a ratio "1:20" for a step-down transformer means Ns:Np). If the question's data or wording is self-contradictory, return answer null.
@@ -391,10 +391,11 @@ const CHECK_SCHEMA = {
       type: 'array',
       items: {
         type: 'object',
-        required: ['index', 'answer', 'explanation'],
+        required: ['index', 'answer', 'answer_text', 'explanation'],
         properties: {
           index: { type: 'integer' },
           answer: { type: ['string', 'null'], enum: ['A', 'B', 'C', 'D', null] },
+          answer_text: { type: ['string', 'null'], description: 'The full text of the chosen option, copied exactly; null when answer is null.' },
           explanation: { type: 'string' },
         },
       },
