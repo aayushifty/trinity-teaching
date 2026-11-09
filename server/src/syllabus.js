@@ -99,6 +99,11 @@ export const SYLLABUS = {
 /** The exams each +2 group prepares for: Physical group IOE, Biology group IOM and IOE. */
 export const GROUP_EXAMS = { PHY: ['IOE'], BIO: ['IOM', 'IOE'] };
 
+/** The official unit names of one exam's syllabus for a subject (e.g. physics IOE → ['Mechanics', …]). */
+export const unitsFor = (subject, exam) => (Array.isArray(SYLLABUS[subject]?.[exam]?.units)
+  ? SYLLABUS[subject][exam].units.map((u) => u[0])
+  : []);
+
 /** Entrance exams that test a subject, limited to the class's group. */
 export function examsFor(subject, group) {
   const forGroup = GROUP_EXAMS[group] || ['IOM', 'IOE'];

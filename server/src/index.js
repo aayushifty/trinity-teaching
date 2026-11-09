@@ -8,7 +8,7 @@
 import * as ai from './ai.js';
 import * as demo from './demo.js';
 import { chapterTerms, terms, shortlist, present, listForPrompt } from './bank.js';
-import { examsFor } from './syllabus.js';
+import { examsFor, unitsFor } from './syllabus.js';
 import { checkWorking } from './arith.js';
 
 const CORS = {
@@ -356,6 +356,12 @@ function arithmeticOk(q) {
   return r.ok;
 }
 
+// What one set of practice questions looks like for each exam, from the official paper formats in syllabus.js.
+const EXAM_MIX = {
+  IOE: 'Write this set ONLY for the IOE B.E./B.Arch. entrance, in its paper style: most questions are multi-step numericals like section B (two ideas combined, formula manipulation, clean final numbers), the rest are limiting-case, graph-reading or precise-statement-of-a-law questions and a few assertion-and-reason or "which statements are correct" items. Set style "IOE". For subjects without numericals (English), follow the IOE English units only.',
+  IOM: 'Write this set ONLY for the IOM / MECEE medical entrance, in its paper style: single-best-answer items with short stems and close-variant distractors; mostly application and understanding items with realistic data, one- or two-step calculations, "which of the following statements are correct" and assertion-and-reason items, plus exact facts and named examples. Set style "IOM".',
+};
+
 // The app waits 240 s for a quiz; finish well inside that.
 const PRACTICE_DEADLINE_MS = 200000;
 
@@ -372,7 +378,8 @@ async function practiceQuestions(env, { context, exams, need, avoid }) {
   const rounds = [];
   for (let round = 0; items.length < need && round < 4 && Date.now() < deadline - 25000; round++) {
     const short = need - items.length;
-    const parts = slideParts(context.slides, Math.ceil(short / BATCH));
+    // At least one set per exam, so a Biology-group quiz always has both IOM and IOE questions.
+    const parts = slideParts(context.slides, Math.max(Math.ceil(short / BATCH), short >= 4 ? exams.length : 1));
     const avoidText = [...avoid, ...items].map((q) => `- ${q.question}`).join('\n');
     const tasks = parts.map((slides, i) => async () => {
       if (Date.now() > deadline - 35000) return { items: [], meta: null }; // too late to start another batch
@@ -383,21 +390,20 @@ async function practiceQuestions(env, { context, exams, need, avoid }) {
           ? `This is set ${i + 1} of ${parts.length} for the same chapter: choose different sub-topics from the other sets.`
           : `This is set ${i + 1} of ${parts.length}: write questions on these slides only.`)
         : '';
-      // Half of every quiz is logical and critical thinking: alternate sets focus on it entirely.
-      const reasoning = parts.length > 1 ? i % 2 === 1 : null;
-      const mix = reasoning === true
-        ? 'In this set write ONLY logical and critical-thinking questions on this chapter (no plain calculations): assertion and reason, statements (which are correct), predict what happens, cause and effect, graph or table interpretation, comparing two situations, and spotting the error in a claim. Use several of these types, all at difficulty 4 or 5.'
-        : reasoning === false
-          ? 'In this set write mostly tough multi-step numericals on this chapter, plus a few prediction or comparison questions.'
-          : 'Make about half of the questions logical and critical-thinking ones (assertion and reason, statements, predict, cause and effect, graph, compare, error spotting) and half tough numericals.';
-      const focus = [where, mix].filter(Boolean).join(' ');
-      const r = await ai.quiz(env, { context: ctx, count: n + 2, exams, pastList: '', avoid: avoidText, focus, until: deadline - 20000 });
+      // Every set is written for ONE entrance exam, in that exam's paper style and syllabus units.
+      const exam = exams[(i + round) % exams.length];
+      const units = unitsFor(context.subject, exam);
+      const focus = [where, EXAM_MIX[exam]].filter(Boolean).join(' ');
+      const r = await ai.quiz(env, { context: ctx, count: n + 2, exams: [exam], units, pastList: '', avoid: avoidText, focus, until: deadline - 20000 });
+      const unitOk = (u) => !units.length || units.some((x) => x.toLowerCase() === String(u || '').trim().toLowerCase());
       const fresh = list(r.items)
         .filter((it) => it && typeof it === 'object' && it.question_id == null && it.question && goodOptions(it.options) && /^[ABCD]$/.test(it.answer))
         // Right grade only: a Class 12 chapter gets Grade 12 questions, a Class 11 chapter Grade 11.
         .filter((it) => !['11', '12'].includes(String(context.cls)) || it.grade == null || String(it.grade) === String(context.cls))
+        // Entrance focus: only questions on an official unit of this set's exam syllabus.
+        .filter((it) => unitOk(it.unit))
         .map((it) => ({
-          kind: 'practice', style: exams.includes(it.style) ? it.style : null, unit: it.unit || null, grade: it.grade || null, qtype: it.qtype || null,
+          kind: 'practice', style: exam, unit: units.find((x) => x.toLowerCase() === String(it.unit || '').trim().toLowerCase()) || it.unit || null, grade: it.grade || null, qtype: it.qtype || null,
           question: it.question, options: it.options, answer: it.answer, answerSource: 'practice',
           explanation: steps(it.explanation), slide: it.slide, difficulty: Math.min(5, Math.max(1, Number(it.difficulty) || 3)),
         }));
